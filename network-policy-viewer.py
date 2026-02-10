@@ -8,7 +8,7 @@ showing ingress and egress traffic flows.
 import json
 import subprocess
 import sys
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
 from tabulate import tabulate
 import argparse
 
@@ -80,11 +80,83 @@ def format_ip_block(ip_block: Dict[str, Any]) -> str:
     return cidr
 
 
-def format_port(port: Dict[str, Any]) -> str:
-    """Format a port specification into a readable string."""
+def resolve_named_port(port_name: str, protocol: str, namespace: str, pod_selector: Optional[Dict[str, Any]] = None, use_kubectl: bool = False) -> Optional[int]:
+    """Resolve a named port to its numeric value by querying pods.
+    
+    Args:
+        port_name: Name of the port to resolve
+        protocol: Protocol (TCP, UDP, SCTP)
+        namespace: Namespace to search in
+        pod_selector: Pod selector to filter pods
+        use_kubectl: Whether to use kubectl instead of oc
+    
+    Returns:
+        Port number if found, None otherwise
+    """
+    try:
+        cmd = ["kubectl"] if use_kubectl else ["oc"]
+        cmd.extend(["get", "pods", "-n", namespace, "-o", "json"])
+        
+        result = run_oc_command(cmd)
+        pods = result.get("items", [])
+        
+        # Filter pods by selector if provided
+        if pod_selector:
+            match_labels = pod_selector.get("matchLabels", {})
+            if match_labels:
+                filtered_pods = []
+                for pod in pods:
+                    pod_labels = pod.get("metadata", {}).get("labels", {})
+                    # Check if all selector labels match
+                    if all(pod_labels.get(k) == v for k, v in match_labels.items()):
+                        filtered_pods.append(pod)
+                pods = filtered_pods
+        
+        # Search for the named port in all matching pods
+        for pod in pods:
+            containers = pod.get("spec", {}).get("containers", [])
+            for container in containers:
+                container_ports = container.get("ports", [])
+                for cp in container_ports:
+                    if cp.get("name") == port_name and cp.get("protocol", "TCP") == protocol:
+                        return int(cp.get("containerPort", 0))
+        
+        return None
+    except Exception:
+        # If we can't resolve, return None
+        return None
+
+
+def format_port(port: Dict[str, Any], namespace: Optional[str] = None, pod_selector: Optional[Dict[str, Any]] = None, use_kubectl: bool = False) -> str:
+    """Format a port specification into a readable string.
+    
+    Args:
+        port: Port specification dictionary
+        namespace: Namespace for resolving named ports
+        pod_selector: Pod selector for resolving named ports
+        use_kubectl: Whether to use kubectl instead of oc
+    
+    Returns:
+        Formatted port string with resolved port numbers if named port was resolved
+    """
     protocol = port.get("protocol", "TCP")
     port_num = port.get("port")
     end_port = port.get("endPort")
+    
+    # If port_num is a string (named port), try to resolve it
+    if isinstance(port_num, str) and namespace:
+        resolved_port = resolve_named_port(port_num, protocol, namespace, pod_selector, use_kubectl)
+        if resolved_port:
+            port_num = resolved_port
+            # Format as "TCP:53 (dns)" to show both the resolved port and the name
+            if end_port:
+                return f"{protocol}:{port_num}-{end_port} ({port.get('port')})"
+            return f"{protocol}:{port_num} ({port.get('port')})"
+        else:
+            # Couldn't resolve, show the name
+            if end_port:
+                return f"{protocol}:{port_num}-{end_port}"
+            return f"{protocol}:{port_num}"
     
     if port_num:
         if end_port:
@@ -93,8 +165,15 @@ def format_port(port: Dict[str, Any]) -> str:
     return protocol
 
 
-def format_ingress_rule(rule: Dict[str, Any]) -> str:
-    """Format an ingress rule into a readable string."""
+def format_ingress_rule(rule: Dict[str, Any], namespace: Optional[str] = None, policy_pod_selector: Optional[Dict[str, Any]] = None, use_kubectl: bool = False) -> str:
+    """Format an ingress rule into a readable string.
+    
+    Args:
+        rule: Ingress rule dictionary
+        namespace: Namespace for resolving named ports (uses policy's namespace)
+        policy_pod_selector: Policy's pod selector (for resolving named ports on target pods)
+        use_kubectl: Whether to use kubectl instead of oc
+    """
     parts = []
     
     # From (sources)
@@ -116,17 +195,29 @@ def format_ingress_rule(rule: Dict[str, Any]) -> str:
         parts.append(" | ".join(source_parts) if source_parts else "All sources")
     
     # Ports
+    # For ingress, ports apply to the pods selected by the policy's podSelector
     ports = rule.get("ports", [])
     if ports:
-        port_strs = [format_port(p) for p in ports]
+        port_strs = [format_port(p, namespace, policy_pod_selector, use_kubectl) for p in ports]
         parts.append(f"Ports: {', '.join(port_strs)}")
     
     return " | ".join(parts)
 
 
-def format_egress_rule(rule: Dict[str, Any]) -> str:
-    """Format an egress rule into a readable string."""
+def format_egress_rule(rule: Dict[str, Any], namespace: Optional[str] = None, policy_namespace: Optional[str] = None, use_kubectl: bool = False) -> str:
+    """Format an egress rule into a readable string.
+    
+    Args:
+        rule: Egress rule dictionary
+        namespace: Destination namespace for resolving named ports (if known)
+        policy_namespace: Policy's namespace (used as fallback for port resolution)
+        use_kubectl: Whether to use kubectl instead of oc
+    """
     parts = []
+    
+    # Initialize variables for port resolution
+    dest_pod_selector = None
+    dest_namespace = namespace or policy_namespace
     
     # To (destinations)
     to_list = rule.get("to", [])
@@ -134,22 +225,39 @@ def format_egress_rule(rule: Dict[str, Any]) -> str:
         parts.append("All destinations")
     else:
         dest_parts = []
+        
         for dest in to_list:
             if "podSelector" in dest:
                 selector = format_selector(dest["podSelector"].get("matchLabels", {}))
                 dest_parts.append(f"Pods: {selector}")
+                # Use the first podSelector found for port resolution
+                if dest_pod_selector is None:
+                    dest_pod_selector = dest["podSelector"]
             if "namespaceSelector" in dest:
                 selector = format_namespace_selector(dest["namespaceSelector"])
                 dest_parts.append(f"Namespaces: {selector}")
+                # Try to extract namespace from namespaceSelector if it uses matchLabels
+                ns_selector = dest.get("namespaceSelector", {})
+                match_labels = ns_selector.get("matchLabels", {})
+                # Check if namespace is specified via kubernetes.io/metadata.name
+                if "kubernetes.io/metadata.name" in match_labels:
+                    dest_namespace = match_labels["kubernetes.io/metadata.name"]
+                elif "name" in match_labels:
+                    dest_namespace = match_labels["name"]
+                else:
+                    # Can't determine specific namespace, set to None
+                    dest_namespace = None
             if "ipBlock" in dest:
                 ip_block = format_ip_block(dest["ipBlock"])
                 dest_parts.append(f"IPs: {ip_block}")
         parts.append(" | ".join(dest_parts) if dest_parts else "All destinations")
     
     # Ports
+    # For egress, ports apply to the destination pods (from "to" section)
     ports = rule.get("ports", [])
     if ports:
-        port_strs = [format_port(p) for p in ports]
+        # Only try to resolve if we have a podSelector and a namespace
+        port_strs = [format_port(p, dest_namespace, dest_pod_selector, use_kubectl) for p in ports]
         parts.append(f"Ports: {', '.join(port_strs)}")
     
     return " | ".join(parts)
@@ -211,11 +319,24 @@ def get_policy_types(policy: Dict[str, Any]) -> tuple:
     return has_ingress, has_egress
 
 
-def analyze_network_policies(namespaces: Optional[List[str]] = None, use_kubectl: bool = False) -> List[List[str]]:
-    """Analyze network policies and return tabular data."""
+def analyze_network_policies(namespaces: Optional[List[str]] = None, use_kubectl: bool = False, policy_type_filter: Optional[str] = None) -> Tuple[List[List[str]], List[str]]:
+    """Analyze network policies and return tabular data.
+    
+    Args:
+        namespaces: List of namespaces to filter. If None or empty, gets all namespaces.
+        use_kubectl: Whether to use kubectl instead of oc.
+        policy_type_filter: Filter by policy type - "ingress", "egress", or None for both.
+    
+    Returns:
+        Tuple of (table_data, headers) where table_data is list of rows and headers is list of column names.
+    """
     policies = get_network_policies(namespaces, use_kubectl)
     
     table_data = []
+    
+    # Determine which columns to include based on filter
+    show_ingress = policy_type_filter is None or policy_type_filter.lower() == "ingress"
+    show_egress = policy_type_filter is None or policy_type_filter.lower() == "egress"
     
     for policy in policies:
         metadata = policy.get("metadata", {})
@@ -230,51 +351,74 @@ def analyze_network_policies(namespaces: Optional[List[str]] = None, use_kubectl
         
         # Policy types
         has_ingress, has_egress = get_policy_types(policy)
+        
+        # Filter policies based on policy_type_filter
+        if policy_type_filter:
+            filter_lower = policy_type_filter.lower()
+            if filter_lower == "ingress" and not has_ingress:
+                continue  # Skip policies without ingress
+            if filter_lower == "egress" and not has_egress:
+                continue  # Skip policies without egress
+        
+        # Build policy types string - if filtering, only show the filtered type
         policy_types = []
-        if has_ingress:
-            policy_types.append("Ingress")
-        if has_egress:
-            policy_types.append("Egress")
+        if policy_type_filter:
+            # When filtering, only show the filtered type
+            filter_lower = policy_type_filter.lower()
+            if filter_lower == "ingress" and has_ingress:
+                policy_types.append("Ingress")
+            elif filter_lower == "egress" and has_egress:
+                policy_types.append("Egress")
+        else:
+            # No filter - show all types the policy has
+            if has_ingress:
+                policy_types.append("Ingress")
+            if has_egress:
+                policy_types.append("Egress")
         types_str = ", ".join(policy_types) if policy_types else "None"
         
+        row = [ns, name, pod_labels, types_str]
+        
         # Ingress rules
-        # In OpenShift/K8s: If policy exists with Ingress type, default is DENY ALL
-        # Only explicitly allowed rules in the ingress array are permitted
-        ingress_rules = spec.get("ingress", [])
-        if not has_ingress:
-            ingress_str = "N/A (not applicable)"
-        elif not ingress_rules:
-            ingress_str = "🚫 Deny all (default - no rules specified)"
-        else:
-            # Show default deny, then list allowed rules
-            ingress_parts = [format_ingress_rule(rule) for rule in ingress_rules]
-            allowed_rules = "\n".join([f"  ✓ {part}" for part in ingress_parts])
-            ingress_str = f"🚫 Deny all (default)\n✅ Allowed:\n{allowed_rules}"
+        if show_ingress:
+            ingress_rules = spec.get("ingress", [])
+            if not has_ingress:
+                ingress_str = "N/A (not applicable)"
+            elif not ingress_rules:
+                ingress_str = "🚫 Deny all (default - no rules specified)"
+            else:
+                # Show default deny, then list allowed rules
+                # For ingress, ports apply to pods selected by the policy's podSelector
+                ingress_parts = [format_ingress_rule(rule, ns, pod_selector, use_kubectl) for rule in ingress_rules]
+                allowed_rules = "\n".join([f"  ✓ {part}" for part in ingress_parts])
+                ingress_str = f"🚫 Deny all (default)\n✅ Allowed:\n{allowed_rules}"
+            row.append(ingress_str)
         
         # Egress rules
-        # In OpenShift/K8s: If policy exists with Egress type, default is DENY ALL
-        # Only explicitly allowed rules in the egress array are permitted
-        egress_rules = spec.get("egress", [])
-        if not has_egress:
-            egress_str = "N/A (not applicable)"
-        elif not egress_rules:
-            egress_str = "🚫 Deny all (default - no rules specified)"
-        else:
-            # Show default deny, then list allowed rules
-            egress_parts = [format_egress_rule(rule) for rule in egress_rules]
-            allowed_rules = "\n".join([f"  ✓ {part}" for part in egress_parts])
-            egress_str = f"🚫 Deny all (default)\n✅ Allowed:\n{allowed_rules}"
+        if show_egress:
+            egress_rules = spec.get("egress", [])
+            if not has_egress:
+                egress_str = "N/A (not applicable)"
+            elif not egress_rules:
+                egress_str = "🚫 Deny all (default - no rules specified)"
+            else:
+                # Show default deny, then list allowed rules
+                # For egress, ports apply to destination pods (from "to" section)
+                egress_parts = [format_egress_rule(rule, None, ns, use_kubectl) for rule in egress_rules]
+                allowed_rules = "\n".join([f"  ✓ {part}" for part in egress_parts])
+                egress_str = f"🚫 Deny all (default)\n✅ Allowed:\n{allowed_rules}"
+            row.append(egress_str)
         
-        table_data.append([
-            ns,
-            name,
-            pod_labels,
-            types_str,
-            ingress_str,
-            egress_str
-        ])
+        table_data.append(row)
     
-    return table_data
+    # Build headers based on what we're showing
+    headers = ["Namespace", "Policy Name", "Pod Selector", "Types"]
+    if show_ingress:
+        headers.append("Ingress Rules")
+    if show_egress:
+        headers.append("Egress Rules")
+    
+    return table_data, headers
 
 
 def main():
@@ -301,6 +445,12 @@ Examples:
 
   # Filter by namespace and export to CSV
   %(prog)s -n production --csv > production-policies.csv
+
+  # Filter by policy type (ingress only)
+  %(prog)s --type ingress
+
+  # Filter by policy type (egress only) and export to CSV
+  %(prog)s --type egress --csv > egress-policies.csv
         """
     )
     parser.add_argument(
@@ -325,6 +475,13 @@ Examples:
         action="store_true",
         help="Output in JSON format"
     )
+    parser.add_argument(
+        "--type",
+        dest="policy_type",
+        choices=["ingress", "egress"],
+        metavar="TYPE",
+        help="Filter by policy type: 'ingress' or 'egress' (default: show both)"
+    )
     
     args = parser.parse_args()
     
@@ -341,27 +498,36 @@ Examples:
     namespaces = args.namespace if args.namespace else None
     
     # Get network policies
-    table_data = analyze_network_policies(namespaces, args.kubectl)
+    table_data, headers = analyze_network_policies(namespaces, args.kubectl, args.policy_type)
     
     if not table_data:
         if namespaces:
             ns_str = ", ".join(namespaces)
-            print(f"No network policies found in namespace(s): {ns_str}")
+            type_str = f" with type '{args.policy_type}'" if args.policy_type else ""
+            print(f"No network policies found in namespace(s): {ns_str}{type_str}")
         else:
-            print("No network policies found.")
+            type_str = f" with type '{args.policy_type}'" if args.policy_type else ""
+            print(f"No network policies found{type_str}.")
         return
     
-    headers = ["Namespace", "Policy Name", "Pod Selector", "Types", "Ingress Rules", "Egress Rules"]
+    # Determine which columns to show (for tabulate maxcolwidths)
+    show_ingress = args.policy_type is None or args.policy_type.lower() == "ingress"
+    show_egress = args.policy_type is None or args.policy_type.lower() == "egress"
     
-    # Show filter info if namespace specified
+    # Show filter info if namespace or policy type specified
     filter_info = ""
+    filter_parts = []
     if namespaces:
         # args.namespace is always a list when using action="append"
         ns_str = ", ".join(namespaces)
         if len(namespaces) == 1:
-            filter_info = f"\nFiltered by namespace: {ns_str}\n"
+            filter_parts.append(f"namespace: {ns_str}")
         else:
-            filter_info = f"\nFiltered by namespaces: {ns_str}\n"
+            filter_parts.append(f"namespaces: {ns_str}")
+    if args.policy_type:
+        filter_parts.append(f"policy type: {args.policy_type}")
+    if filter_parts:
+        filter_info = f"\nFiltered by {', '.join(filter_parts)}\n"
     
     if args.json:
         # Output as JSON
@@ -383,11 +549,18 @@ Examples:
         print("NOTE: In OpenShift/Kubernetes, NetworkPolicies enforce 'deny all' by default.")
         print("      Only traffic matching the explicitly allowed rules below is permitted.\n")
         print("="*120 + "\n")
+        # Adjust maxcolwidths based on number of columns
+        col_widths = [20, 25, 25, 10]
+        if show_ingress:
+            col_widths.append(50)
+        if show_egress:
+            col_widths.append(50)
+        
         print(tabulate(
             table_data,
             headers=headers,
             tablefmt="grid",
-            maxcolwidths=[20, 25, 25, 10, 50, 50]
+            maxcolwidths=col_widths
         ))
         print(f"\nTotal policies: {len(table_data)}")
         print("\nLegend:")

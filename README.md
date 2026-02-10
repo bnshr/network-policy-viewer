@@ -25,6 +25,12 @@ python3 network-policy-viewer.py -n my-namespace
 
 # Export to CSV
 python3 network-policy-viewer.py --csv > policies.csv
+
+# Filter by policy type (ingress only)
+python3 network-policy-viewer.py --type ingress
+
+# Filter by policy type (egress only) and export to CSV
+python3 network-policy-viewer.py --type egress --csv > egress-policies.csv
 ```
 
 ### Bash Script
@@ -38,11 +44,19 @@ chmod +x network-policy-viewer.sh
 
 # View policies in a specific namespace
 ./network-policy-viewer.sh -n my-namespace
+
+# Filter by policy type (ingress only)
+./network-policy-viewer.sh --type ingress
+
+# Filter by policy type (egress only) and export to CSV
+./network-policy-viewer.sh --type egress --csv > egress-policies.csv
 ```
 
 ## Documentation
 
-- See **`README-network-policy-viewer.md`** for detailed usage instructions, examples, and troubleshooting
+- **`README-network-policy-viewer.md`** - Detailed usage instructions, examples, and troubleshooting
+- **`POD_SELECTOR_EXPLAINED.md`** - Understanding "Pod Selector: All pods" and how pod selectors work
+- **`NETWORK_POLICY_VIEWER_IDEAS.md`** - Implementation ideas and advanced features
 
 ## Prerequisites
 
